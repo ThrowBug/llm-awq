@@ -7,6 +7,10 @@ from transformers.models.opt.modeling_opt import OPTDecoderLayer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMSNorm
 from transformers.activations import GELUActivation
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm, Qwen2DecoderLayer
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeDecoderLayer,
+    Qwen3MoeRMSNorm,
+)
 
 from .qmodule import ScaledActivation
 from ..utils.module import get_op_by_name, get_op_name, set_op_by_name
@@ -84,36 +88,49 @@ def scale_gelu_fc(gelu, fc, scales):
 
 
 @torch.no_grad()
-def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
+def auto_scale_block(
+    module,
+    module_kwargs,
+    w_bit,
+    q_config,
+    input_feat,
+    quant_policy=None,
+    search_batch_size=1,
+):
     from .quantizer import pseudo_quantize_tensor
 
-    # firstly, get the weight quantize function
-    if w_bit is not None:
+    module_kwargs = dict(module_kwargs)
+    module_kwargs.pop("use_cache", None)
 
-        def w_quantize_func(p):
-            return pseudo_quantize_tensor(
-                p,
-                n_bit=w_bit,
-                **q_config,
-            ).detach()
+    def _module_output(module_output):
+        if isinstance(module_output, (tuple, list)):
+            return module_output[0]
+        return module_output
 
-    else:
-
-        def w_quantize_func(p):
-            return p
-
-    if "use_cache" in module_kwargs:
-        module_kwargs.pop("use_cache")
+    def _input_chunks(x):
+        chunk_size = search_batch_size if x.dim() >= 3 else 4096
+        return [x[i : i + chunk_size] for i in range(0, x.shape[0], chunk_size)]
 
     # find the best scale ratio
-    def _search_module_scale(block, linears2scale: list, x, kwargs={}):
+    def _search_module_scale(
+        block, linears2scale, x, kwargs=None, quant_bits=None
+    ):
         # w: co, ci
         # x: n, ci
-        x = x.to(next(block.parameters()).device)
-        with torch.no_grad():
-            org_out = block(x, **kwargs)
-            if isinstance(org_out, tuple):
-                org_out = org_out[0]
+        kwargs = kwargs or {}
+        if quant_bits is None:
+            quant_bits = [w_bit] * len(linears2scale)
+        if len(quant_bits) != len(linears2scale):
+            raise ValueError("quant_bits and linears2scale must have the same length.")
+        if any(bit is None for bit in quant_bits):
+            raise ValueError("Every AWQ scale-search target must have a quantization bit.")
+
+        device = next(block.parameters()).device
+        x_chunks = _input_chunks(x)
+        org_out_chunks = []
+        for x_chunk in x_chunks:
+            org_out = _module_output(block(x_chunk.to(device), **kwargs))
+            org_out_chunks.append(org_out.detach().cpu())
 
         x_max = get_act_scale(x)
 
@@ -124,21 +141,25 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
         n_grid = 20
         history = []
 
-        org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
+        org_sd = {k: v.detach().cpu().clone() for k, v in block.state_dict().items()}
         for ratio in range(n_grid):
             ratio = ratio * 1 / n_grid
             scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
             scales = scales / (scales.max() * scales.min()).sqrt()
-            for fc in linears2scale:
+            for fc, bit in zip(linears2scale, quant_bits):
                 fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
-                fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
-            out = block(x, **kwargs)
-            if isinstance(out, tuple):
-                out = out[0]
+                fc.weight.data = pseudo_quantize_tensor(
+                    fc.weight.data, n_bit=bit, **q_config
+                ).detach() / scales.view(1, -1).to(fc.weight.device)
 
-            loss = (
-                (org_out - out).float().pow(2).mean().item()
-            )  # float prevents overflow
+            squared_error = 0.0
+            numel = 0
+            for x_chunk, org_out in zip(x_chunks, org_out_chunks):
+                out = _module_output(block(x_chunk.to(device), **kwargs))
+                diff = org_out.to(out.device) - out
+                squared_error += diff.float().pow(2).sum().item()
+                numel += diff.numel()
+            loss = squared_error / numel
             history.append(loss)
             is_best = loss < best_error
             if is_best:
@@ -155,18 +176,30 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
         assert torch.isnan(best_scales).sum() == 0, best_scales
         return best_scales.detach()
 
-    def _auto_get_scale(prev_op, layers, inp, module2inspect=None, kwargs={}):
+    def _auto_get_scale(
+        prev_op,
+        layers,
+        inp,
+        module2inspect=None,
+        kwargs=None,
+        quant_bits=None,
+        rescale_layers=None,
+    ):
         # module2inspect: if given, we will check the output diff of this module instead of layers
         if module2inspect is None:
             assert len(layers) == 1
             module2inspect = layers[0]
 
-        scales = _search_module_scale(module2inspect, layers, inp, kwargs)
+        scales = _search_module_scale(
+            module2inspect, layers, inp, kwargs, quant_bits=quant_bits
+        )
         scales = scales.detach().cpu()
+        if rescale_layers is None:
+            rescale_layers = layers
         # prev_op_name, [layer_name], scale
         return (
             get_op_name(module, prev_op),
-            tuple([get_op_name(module, m) for m in layers]),
+            tuple([get_op_name(module, m) for m in rescale_layers]),
             scales,
         )
 
@@ -211,6 +244,66 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
                 inp=input_feat["fc2"],
             )
         )
+
+    elif isinstance(module, Qwen3MoeDecoderLayer):
+        if quant_policy is None:
+            raise ValueError("Qwen3-MoE scaling requires a heterogeneous policy.")
+
+        attention_inputs = [
+            module.self_attn.q_proj,
+            module.self_attn.k_proj,
+            module.self_attn.v_proj,
+        ]
+        scales_list.append(
+            _auto_get_scale(
+                prev_op=module.input_layernorm,
+                layers=attention_inputs,
+                inp=input_feat["self_attn.q_proj"],
+                module2inspect=module.self_attn,
+                kwargs=module_kwargs,
+                quant_bits=[quant_policy.attn_w_bit] * len(attention_inputs),
+            )
+        )
+        if module.self_attn.v_proj.weight.shape == module.self_attn.o_proj.weight.shape:
+            scales_list.append(
+                _auto_get_scale(
+                    prev_op=module.self_attn.v_proj,
+                    layers=[module.self_attn.o_proj],
+                    inp=input_feat["self_attn.o_proj"],
+                    quant_bits=[quant_policy.attn_w_bit],
+                )
+            )
+
+        expert_inputs = []
+        for expert in module.mlp.experts:
+            expert_inputs.extend([expert.gate_proj, expert.up_proj])
+        scales_list.append(
+            _auto_get_scale(
+                prev_op=module.post_attention_layernorm,
+                layers=expert_inputs,
+                inp=input_feat["mlp"],
+                module2inspect=module.mlp,
+                quant_bits=[quant_policy.expert_w_bit] * len(expert_inputs),
+                # The router stays full precision but consumes the inversely-scaled
+                # hidden states, so its columns must absorb the exact scale too.
+                rescale_layers=[module.mlp.gate] + expert_inputs,
+            )
+        )
+        for expert_idx, expert in enumerate(module.mlp.experts):
+            down_name = f"mlp.experts.{expert_idx}.down_proj"
+            if down_name not in input_feat:
+                raise RuntimeError(
+                    f"Calibration did not route any token through {down_name}; "
+                    "increase the calibration sample count."
+                )
+            scales_list.append(
+                _auto_get_scale(
+                    prev_op=expert.up_proj,
+                    layers=[expert.down_proj],
+                    inp=input_feat[down_name],
+                    quant_bits=[quant_policy.expert_w_bit],
+                )
+            )
 
     elif isinstance(module, (LlamaDecoderLayer, Qwen2DecoderLayer)):
         # attention input
@@ -459,7 +552,9 @@ def apply_scale(module, scales_list, input_feat_dict=None):
         if isinstance(prev_op, nn.Linear):
             assert len(layers) == 1
             scale_fc_fc(prev_op, layers[0], scales)
-        elif isinstance(prev_op, (nn.LayerNorm, LlamaRMSNorm, Qwen2RMSNorm)):
+        elif isinstance(
+            prev_op, (nn.LayerNorm, LlamaRMSNorm, Qwen2RMSNorm, Qwen3MoeRMSNorm)
+        ):
             scale_ln_fcs(prev_op, layers, scales)
         elif isinstance(prev_op, (nn.GELU, BloomGelu, GELUActivation, nn.SiLU)):
             new_module = ScaledActivation(prev_op, scales)
@@ -470,9 +565,14 @@ def apply_scale(module, scales_list, input_feat_dict=None):
 
         # apply the scaling to input feat if given; prepare it for clipping
         if input_feat_dict is not None:
+            scaled_inputs = set()
             for layer_name in layer_names:
-                inp = input_feat_dict[layer_name]
-                inp.div_(scales.view(1, -1).to(inp.device).to(inp.dtype))
+                if layer_name in input_feat_dict:
+                    inp = input_feat_dict[layer_name]
+                    if id(inp) in scaled_inputs:
+                        continue
+                    inp.div_(scales.view(1, -1).to(inp.device).to(inp.dtype))
+                    scaled_inputs.add(id(inp))
 
         prev_op.cpu()
         for layer in layers:

@@ -20,7 +20,8 @@ def auto_clip_layer(
     )
     input_feat = input_feat.view(-1, input_feat.shape[-1])
     input_feat = input_feat.reshape(1, input_feat.shape[0], -1, group_size)
-    input_feat = input_feat[:, 0 :: input_feat.shape[1] // n_sample_token]
+    sample_step = max(1, input_feat.shape[1] // n_sample_token)
+    input_feat = input_feat[:, 0::sample_step]
     w = w.reshape(w.shape[0], 1, -1, group_size)
 
     oc_batch_size = 256 if w.shape[0] % 256 == 0 else 64  # prevent OOM
@@ -64,19 +65,29 @@ def auto_clip_layer(
 
 
 @torch.no_grad()
-def auto_clip_block(module, w_bit, q_config, input_feat):
+def auto_clip_block(module, w_bit, q_config, input_feat, quant_policy=None):
     named_linears = {
         name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)
     }
 
     clip_list = []
     for name in named_linears:
+        layer_w_bit = quant_policy.bit_for(name) if quant_policy else w_bit
+        if layer_w_bit is None:
+            continue
         # due to qk bmm, it is hard to clip precisely
         if any([_ in name for _ in ["q_", "k_", "query", "key", "Wqkv"]]):
             continue
+        if name not in input_feat:
+            raise RuntimeError(
+                f"No calibration activation was captured for quantized layer {name}."
+            )
         named_linears[name].cuda()
         max_val = auto_clip_layer(
-            named_linears[name].weight, input_feat[name], n_bit=w_bit, q_config=q_config
+            named_linears[name].weight,
+            input_feat[name],
+            n_bit=layer_w_bit,
+            q_config=q_config,
         )
         clip_list.append((name, max_val))
         named_linears[name].cpu()

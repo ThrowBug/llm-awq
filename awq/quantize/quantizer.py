@@ -108,6 +108,7 @@ def pseudo_quantize_model_weight(
     model,
     w_bit,
     q_config,
+    quant_policy=None,
 ):
     from .pre_quant import get_blocks, get_named_linears
 
@@ -115,9 +116,12 @@ def pseudo_quantize_model_weight(
     for i in tqdm(range(len(layers)), desc="pseudo weight quantization..."):
         named_linears = get_named_linears(layers[i])
         for n, m in named_linears.items():
+            layer_w_bit = quant_policy.bit_for(n) if quant_policy else w_bit
+            if layer_w_bit is None:
+                continue
             m.cuda()
             m.weight.data = pseudo_quantize_tensor(
-                m.weight.data, n_bit=w_bit, **q_config
+                m.weight.data, n_bit=layer_w_bit, **q_config
             )
             m.cpu()
 

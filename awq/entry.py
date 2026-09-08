@@ -17,6 +17,11 @@ from awq.quantize.quantizer import (
     pseudo_quantize_model_weight,
     real_quantize_model_weight,
 )
+from awq.quantize.qwen3_moe import (
+    Qwen3MoeQuantPolicy,
+    quantization_summary,
+)
+from awq.utils.fake_checkpoint import save_fake_quant_checkpoint
 from awq.utils.lm_eval_adaptor import LMEvalAdaptor
 from awq.utils.utils import simple_dispatch_model
 from datasets import load_dataset
@@ -49,6 +54,8 @@ parser.add_argument(
 )
 # quantization config
 parser.add_argument("--w_bit", type=int, default=None)
+parser.add_argument("--expert_w_bit", type=int, default=None)
+parser.add_argument("--attn_w_bit", type=int, default=None)
 parser.add_argument("--q_group_size", type=int, default=-1)
 parser.add_argument("--no_zero_point", action="store_true", help="disable zero_point")
 parser.add_argument("--q_backend", type=str, default="fake", choices=["fake", "real"])
@@ -65,6 +72,21 @@ parser.add_argument(
 )
 parser.add_argument(
     "--load_awq", type=str, default=None, help="load the awq search results"
+)
+parser.add_argument(
+    "--calib_dataset", type=str, default="pileval", choices=["pileval", "c4"]
+)
+parser.add_argument("--calib_data_path", type=str, default=None)
+parser.add_argument("--n_samples", type=int, default=128)
+parser.add_argument("--seqlen", type=int, default=512)
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--calib_batch_size", type=int, default=1)
+parser.add_argument("--use_fast", action="store_true")
+parser.add_argument(
+    "--save_dtype",
+    type=str,
+    default="bfloat16",
+    choices=["float16", "bfloat16"],
 )
 parser.add_argument(
     "--vila-15",
@@ -121,8 +143,6 @@ print("Quantization config:", q_config)
 
 def build_model_and_enc(model_path, dtype):
     torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
-    if not os.path.exists(model_path):  # look into ssd
-        raise FileNotFoundError(f"{model_path} not found!")
     print(f"* Building model {model_path}")
 
     # all hf model
@@ -140,6 +160,7 @@ def build_model_and_enc(model_path, dtype):
     else:
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         # Note (Haotian): To avoid OOM after huggingface transformers 4.36.2
+        original_use_cache = getattr(config, "use_cache", True)
         config.use_cache = False
         if "mpt" in config.__class__.__name__.lower():
             enc = AutoTokenizer.from_pretrained(
@@ -147,8 +168,24 @@ def build_model_and_enc(model_path, dtype):
             )
         else:
             enc = AutoTokenizer.from_pretrained(
-                model_path, use_fast=False, trust_remote_code=True
+                model_path, use_fast=args.use_fast, trust_remote_code=True
             )
+
+    quant_policy = None
+    if args.expert_w_bit is not None or args.attn_w_bit is not None:
+        if args.expert_w_bit is None or args.attn_w_bit is None:
+            raise ValueError(
+                "--expert_w_bit and --attn_w_bit must be specified together."
+            )
+        if getattr(config, "model_type", None) != "qwen3_moe":
+            raise ValueError(
+                "The heterogeneous expert/attention policy currently supports "
+                "only model_type=qwen3_moe."
+            )
+        quant_policy = Qwen3MoeQuantPolicy(
+            expert_w_bit=args.expert_w_bit,
+            attn_w_bit=args.attn_w_bit,
+        )
 
     if args.load_quant:  # directly load quantized weights
         print("Loading pre-computed quantized weights...")
@@ -172,6 +209,7 @@ def build_model_and_enc(model_path, dtype):
                 "BloomBlock",
                 "MPTBlock",
                 "DecoderLayer",
+                "Qwen3MoeDecoderLayer",
             ],
             **kwargs,
         )
@@ -196,6 +234,10 @@ def build_model_and_enc(model_path, dtype):
             )
 
         model.eval()
+        if not vila_10_quant_mode:
+            model._awq_original_use_cache = original_use_cache
+        if quant_policy is not None:
+            print("Qwen3-MoE quantization policy:", quantization_summary(model, quant_policy))
 
         if args.run_awq:
             assert args.dump_awq, "Please save the awq results with --dump_awq"
@@ -205,12 +247,18 @@ def build_model_and_enc(model_path, dtype):
                 enc,
                 w_bit=args.w_bit,
                 q_config=q_config,
-                n_samples=128,
-                seqlen=512,
+                n_samples=args.n_samples,
+                seqlen=args.seqlen,
+                calib_data=args.calib_dataset,
+                calib_data_path=args.calib_data_path,
+                calib_batch_size=args.calib_batch_size,
+                seed=args.seed,
+                quant_policy=quant_policy,
             )
             if args.dump_awq:
                 dirpath = os.path.dirname(args.dump_awq)
-                os.makedirs(dirpath, exist_ok=True)
+                if dirpath:
+                    os.makedirs(dirpath, exist_ok=True)
 
                 torch.save(awq_results, args.dump_awq)
                 print("AWQ results saved at", args.dump_awq)
@@ -220,19 +268,51 @@ def build_model_and_enc(model_path, dtype):
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
             awq_results = torch.load(args.load_awq, map_location="cpu")
-            apply_awq(model, awq_results)
+            apply_awq(
+                model,
+                awq_results,
+                quant_policy=quant_policy,
+                q_config=q_config,
+            )
 
         # weight quantization
-        if args.w_bit is not None:
+        if args.w_bit is not None or quant_policy is not None:
             if args.q_backend == "fake":
                 assert (
                     args.dump_quant is None
                 ), "Need to use real quantization to dump quantized weights"
-                pseudo_quantize_model_weight(model, w_bit=args.w_bit, q_config=q_config)
+                pseudo_quantize_model_weight(
+                    model,
+                    w_bit=args.w_bit,
+                    q_config=q_config,
+                    quant_policy=quant_policy,
+                )
                 if args.dump_fake:
-                    model.save_pretrained(args.dump_fake)
+                    metadata = {
+                        "format": "awq-pseudo-quantized-hf-checkpoint",
+                        "model_path": model_path,
+                        "quant_policy": (
+                            quant_policy.to_dict() if quant_policy else {"w_bit": args.w_bit}
+                        ),
+                        "q_config": dict(q_config),
+                        "awq_search": (
+                            awq_results.get("metadata") if args.load_awq else None
+                        ),
+                    }
+                    save_fake_quant_checkpoint(
+                        model,
+                        enc,
+                        args.dump_fake,
+                        metadata=metadata,
+                        save_dtype=args.save_dtype,
+                    )
                     print("Pseudo-quantized models saved at", args.dump_fake)
+                    exit(0)
             elif args.q_backend == "real":  # real quantization
+                if quant_policy is not None:
+                    raise NotImplementedError(
+                        "The heterogeneous Qwen3-MoE policy supports fake quantization only."
+                    )
                 real_quantize_model_weight(model, w_bit=args.w_bit, q_config=q_config)
                 if args.dump_quant:
                     if not args.dump_quant.endswith("v2.pt"):
@@ -262,6 +342,7 @@ def build_model_and_enc(model_path, dtype):
                 "BloomBlock",
                 "MPTBlock",
                 "DecoderLayer",
+                "Qwen3MoeDecoderLayer",
             ],
             **kwargs,
         )
