@@ -127,17 +127,25 @@ def _qwen3_hook_targets(named_linears):
     return names
 
 
-def _alias_qwen3_inputs(input_feat, named_linears):
+def _alias_qwen3_inputs(input_feat, layer):
     input_feat["self_attn.v_proj"] = input_feat["self_attn.q_proj"]
-    for name in named_linears:
-        if name.startswith("mlp.experts.") and name.endswith(".up_proj"):
-            gate_name = name[: -len("up_proj")] + "gate_proj"
-            if gate_name not in input_feat:
-                raise RuntimeError(
-                    f"Calibration did not route any token through {gate_name}; "
-                    "increase the calibration sample count."
-                )
-            input_feat[name] = input_feat[gate_name]
+    unhit_experts = []
+    for expert_idx in range(len(layer.mlp.experts)):
+        prefix = f"mlp.experts.{expert_idx}."
+        gate_name = prefix + "gate_proj"
+        up_name = prefix + "up_proj"
+        down_name = prefix + "down_proj"
+        if gate_name not in input_feat or down_name not in input_feat:
+            # A router can legitimately leave an expert unused. Remove any
+            # partially-captured features so all expert-specific AWQ steps use
+            # the same deterministic fallback.
+            input_feat.pop(gate_name, None)
+            input_feat.pop(up_name, None)
+            input_feat.pop(down_name, None)
+            unhit_experts.append(expert_idx)
+            continue
+        input_feat[up_name] = input_feat[gate_name]
+    return unhit_experts
 
 
 @torch.no_grad()
@@ -254,6 +262,10 @@ def run_awq(
                 "batch_size": calib_batch_size,
                 "input_ids_sha256": sample_hash,
             },
+            "fallbacks": {
+                "strategy": "common_scale_then_rtn",
+                "unhit_experts": [],
+            },
         },
     }
 
@@ -302,7 +314,29 @@ def run_awq(
         inps = torch.cat(next_inps, dim=0)
         input_feat = {key: torch.cat(value, dim=0) for key, value in input_feat.items()}
         if qwen3_moe:
-            _alias_qwen3_inputs(input_feat, named_linears)
+            unhit_experts = _alias_qwen3_inputs(input_feat, layer)
+            if unhit_experts:
+                print(
+                    f"[AWQ warning] Layer {i}: calibration did not route tokens "
+                    f"to experts {unhit_experts}. Their expert-specific scale and "
+                    "clipping steps will be skipped; W2 fake quantization remains enabled."
+                )
+                for expert_idx in unhit_experts:
+                    awq_results["metadata"]["fallbacks"]["unhit_experts"].append(
+                        {
+                            "layer": i,
+                            "expert": expert_idx,
+                            "skipped": [
+                                "up_to_down_scale",
+                                "gate_proj_clip",
+                                "up_proj_clip",
+                                "down_proj_clip",
+                            ],
+                            "final_quantization": (
+                                f"W{quant_policy.expert_w_bit}"
+                            ),
+                        }
+                    )
 
         torch.cuda.empty_cache()
         if auto_scale:

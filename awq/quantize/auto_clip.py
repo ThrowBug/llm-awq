@@ -79,6 +79,11 @@ def auto_clip_block(module, w_bit, q_config, input_feat, quant_policy=None):
         if any([_ in name for _ in ["q_", "k_", "query", "key", "Wqkv"]]):
             continue
         if name not in input_feat:
+            if quant_policy is not None and name.startswith("mlp.experts."):
+                # Unused MoE experts have no activation-conditioned objective.
+                # Leave their weights unclipped; final pseudo quantization still
+                # applies according to quant_policy.
+                continue
             raise RuntimeError(
                 f"No calibration activation was captured for quantized layer {name}."
             )

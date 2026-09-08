@@ -292,10 +292,10 @@ def auto_scale_block(
         for expert_idx, expert in enumerate(module.mlp.experts):
             down_name = f"mlp.experts.{expert_idx}.down_proj"
             if down_name not in input_feat:
-                raise RuntimeError(
-                    f"Calibration did not route any token through {down_name}; "
-                    "increase the calibration sample count."
-                )
+                # The common MoE input scale has already been searched for and
+                # will still be applied. With no routed activation, keep the
+                # expert's internal up-to-down transformation at identity.
+                continue
             scales_list.append(
                 _auto_get_scale(
                     prev_op=expert.up_proj,
