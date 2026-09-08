@@ -154,7 +154,7 @@ def build_model_and_enc(model_path, dtype):
         print("Loading pre-computed quantized weights...")
         with init_empty_weights():
             model = AutoModelForCausalLM.from_config(
-                config=config, torch_dtype=torch_dtype, trust_remote_code=True
+                config=config, dtype=torch_dtype, trust_remote_code=True
             )
         real_quantize_model_weight(
             model, w_bit=args.w_bit, q_config=q_config, init_only=True
@@ -189,7 +189,7 @@ def build_model_and_enc(model_path, dtype):
     else:  # fp16 to quantized
         args.run_awq &= not args.load_awq  # if load_awq, no need to run awq
         # Init model on CPU:
-        kwargs = {"torch_dtype": torch_dtype, "low_cpu_mem_usage": True}
+        kwargs = {"dtype": torch_dtype, "low_cpu_mem_usage": True}
         if not vila_10_quant_mode:
             model = AutoModelForCausalLM.from_pretrained(
                 model_path, config=config, trust_remote_code=True, **kwargs

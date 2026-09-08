@@ -210,7 +210,7 @@ if __name__ == "__main__":
         loaded_model = AutoModelForCausalLM.from_pretrained(
             args.model_path,
             config=config,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             trust_remote_code=True,
         )
         model = (

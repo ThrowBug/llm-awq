@@ -185,7 +185,7 @@ def build_llm_and_tokenizer(
         llm = AutoModelForCausalLM.from_pretrained(
             fp8_model_name_or_path,
             config=llm_cfg,
-            torch_dtype=eval(config.model_dtype),
+            dtype=eval(config.model_dtype),
             *args,
             **kwargs,
         )
@@ -194,7 +194,7 @@ def build_llm_and_tokenizer(
         llm = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             config=llm_cfg,
-            torch_dtype=eval(config.model_dtype),
+            dtype=eval(config.model_dtype),
             *args,
             **kwargs,
         )
